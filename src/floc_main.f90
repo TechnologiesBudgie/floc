@@ -70,14 +70,20 @@ PROGRAM floc
   max_file_size = 10485760_8
   opt_quiet = .FALSE.;  opt_by_file = .FALSE.
 
-  ! Default excluded directories (same list as cloc)
-  CALL push_excl('.git');         CALL push_excl('.svn')
-  CALL push_excl('.hg');          CALL push_excl('node_modules')
-  CALL push_excl('vendor');       CALL push_excl('__pycache__')
-  CALL push_excl('.mypy_cache');  CALL push_excl('dist')
-  CALL push_excl('build');        CALL push_excl('target')
-  CALL push_excl('.idea');        CALL push_excl('.vscode')
-  CALL push_excl('.cache');       CALL push_excl('coverage')
+  ! Default excluded directories — matches cloc v2.08 defaults exactly.
+  !
+  ! cloc only skips VCS metadata and node_modules by default.
+  ! It does NOT skip dist/, build/, vendor/, target/, etc. — those contain
+  ! real source code in many projects and users must opt in with --exclude-dir.
+  !
+  ! Keeping this list minimal avoids the "FLOC found X, cloc found Y" surprise.
+  CALL push_excl('.git')
+  CALL push_excl('.svn')
+  CALL push_excl('.hg')
+  CALL push_excl('.cvs')
+  CALL push_excl('node_modules')
+  CALL push_excl('__pycache__')
+  CALL push_excl('.mypy_cache')
 
   CALL parse_args()
 

@@ -71,7 +71,7 @@ F="$TMPDIR_T/t.sh"
   echo 'X=1  # inline'
   echo 'Y=2'
 } > "$F"
-check "Shell hash comments" 1 2 2 "$F"
+check "Shell hash comments" 1 1 3 "$F"
 
 # ── HTML: <!-- --> block comments ─────────────────────────────────────────────
 F="$TMPDIR_T/t.html"

@@ -116,6 +116,27 @@ CONTAINS
     CLOSE(lu)
     ! ios /= 0 after partial read is OK (e.g. binary file smaller than fsize)
 
+    ! ── Skip binary files (contain null bytes in first 8 KB) ──────────────────
+    !    cloc skips binary files entirely; checking only the first 8 KB keeps
+    !    this O(1) rather than O(file_size).
+    !    We return ok=.FALSE. so the caller's CYCLE skips lang_files counting.
+    IF (is_binary(buf, MIN(nbytes, 8192))) THEN
+      DEALLOCATE(buf)
+      RETURN   ! ok stays .FALSE. → caller skips this file entirely
+    END IF
+
+    ! ── Skip auto-generated files (cloc behaviour) ────────────────────────────
+    !    Many tools write a machine-readable marker on the first two lines:
+    !      "// Code generated"  — Go protobuf, gRPC, mockgen, stringer, …
+    !      "// DO NOT EDIT"     — generic Go generate output
+    !      "// @generated"      — JS/TS codegen (Relay, GraphQL)
+    !      "# This file is auto-generated" — Python codegen
+    !    Checking only the first 256 bytes keeps this essentially free.
+    IF (is_generated(buf, MIN(nbytes, 256))) THEN
+      DEALLOCATE(buf)
+      RETURN   ! ok stays .FALSE. → caller skips this file entirely
+    END IF
+
     ! ── Dispatch to per-style counter ────────────────────────────────────────
     SELECT CASE (cstyle)
       CASE (CS_C)
@@ -327,21 +348,35 @@ CONTAINS
     INTEGER :: state, i, lf
     CHARACTER(LEN=1) :: c
 
-    state = 0;  lf = 0
+    ! at_bol tracks whether we are at the first non-ws char of a line.
+    ! Needed for shebang detection: #! at position 1 of line 1 is code.
+    LOGICAL :: at_bol_hash
+    INTEGER :: line_num_hash
+
+    state = 0;  lf = 0;  at_bol_hash = .TRUE.;  line_num_hash = 1
     DO i = 1, n
       c = buf(i)
       SELECT CASE (state)
         CASE (0)
           IF (ICHAR(c) == 10) THEN
             CALL flush_line(lf, res);  lf = 0
+            at_bol_hash = .TRUE.;  line_num_hash = line_num_hash + 1
           ELSE IF (c == '#') THEN
-            state = 1;  lf = IOR(lf, HAS_COMMENT)
+            ! Shebang (#!) on line 1 counts as code, like cloc
+            IF (at_bol_hash .AND. line_num_hash == 1 .AND. &
+                str_starts(buf, n, i, '#!')) THEN
+              lf = IOR(lf, HAS_CODE);  state = 1   ! skip rest of shebang line
+            ELSE
+              state = 1;  lf = IOR(lf, HAS_COMMENT)
+            END IF
+            at_bol_hash = .FALSE.
           ELSE IF (.NOT. is_ws(c)) THEN
-            lf = IOR(lf, HAS_CODE)
+            lf = IOR(lf, HAS_CODE);  at_bol_hash = .FALSE.
           END IF
-        CASE (1)   ! in line comment
+        CASE (1)   ! in line comment (or shebang remainder)
           IF (ICHAR(c) == 10) THEN
             CALL flush_line(lf, res);  lf = 0;  state = 0
+            at_bol_hash = .TRUE.;  line_num_hash = line_num_hash + 1
           END IF
       END SELECT
     END DO
@@ -575,7 +610,16 @@ CONTAINS
   END SUBROUTINE count_lua_style
 
   ! ===========================================================================
-  ! CS_FORTRAN90  —  ! line comments only
+  ! CS_FORTRAN90  —  ! line comment, suppressed inside string literals.
+  !
+  !  States:
+  !    0  normal code
+  !    1  in ! comment (to end of line)
+  !    2  in double-quoted string  ("…")
+  !    3  in single-quoted string  ('…')  — Fortran character literals
+  !
+  !  cloc quirk matched: a ! inside "string" or 'string' is NOT a comment.
+  !  e.g.:  WRITE(*,'(A)') "Hello ! World"  → code line, not comment.
   ! ===========================================================================
   SUBROUTINE count_fortran_style(buf, n, res)
     CHARACTER(LEN=1), INTENT(IN) :: buf(:)
@@ -589,18 +633,46 @@ CONTAINS
     DO i = 1, n
       c = buf(i)
       SELECT CASE (state)
+
+        ! ── Normal ────────────────────────────────────────────────────────────
         CASE (0)
           IF (ICHAR(c) == 10) THEN
             CALL flush_line(lf, res);  lf = 0
           ELSE IF (c == '!') THEN
             state = 1;  lf = IOR(lf, HAS_COMMENT)
+          ELSE IF (ICHAR(c) == 34) THEN      ! " opens string
+            state = 2;  lf = IOR(lf, HAS_CODE)
+          ELSE IF (ICHAR(c) == 39) THEN      ! ' opens character literal
+            state = 3;  lf = IOR(lf, HAS_CODE)
           ELSE IF (.NOT. is_ws(c)) THEN
             lf = IOR(lf, HAS_CODE)
           END IF
+
+        ! ── In ! comment ─────────────────────────────────────────────────────
         CASE (1)
           IF (ICHAR(c) == 10) THEN
             CALL flush_line(lf, res);  lf = 0;  state = 0
           END IF
+
+        ! ── In double-quoted string ───────────────────────────────────────────
+        ! Fortran strings double the delimiter to escape: "it""s" = it"s
+        CASE (2)
+          lf = IOR(lf, HAS_CODE)
+          IF (ICHAR(c) == 34) THEN      ! closing "
+            state = 0
+          ELSE IF (ICHAR(c) == 10) THEN ! unterminated string — treat as end
+            CALL flush_line(lf, res);  lf = 0;  state = 0
+          END IF
+
+        ! ── In single-quoted character literal ───────────────────────────────
+        CASE (3)
+          lf = IOR(lf, HAS_CODE)
+          IF (ICHAR(c) == 39) THEN      ! closing '
+            state = 0
+          ELSE IF (ICHAR(c) == 10) THEN
+            CALL flush_line(lf, res);  lf = 0;  state = 0
+          END IF
+
       END SELECT
     END DO
     IF (lf /= 0) CALL flush_line(lf, res)
@@ -766,6 +838,64 @@ CONTAINS
     END DO
     IF (lf /= 0) res%code = res%code + 1
   END SUBROUTINE count_no_comments
+
+  ! ===========================================================================
+  ! PRIVATE: is_binary — returns .TRUE. if buf(1:n) contains a NUL byte.
+  !   Checks at most the first n bytes; n should be capped at ~8 KB.
+  ! ===========================================================================
+  PURE FUNCTION is_binary(buf, n) RESULT(bin)
+    CHARACTER(LEN=1), INTENT(IN) :: buf(:)
+    INTEGER,          INTENT(IN) :: n
+    LOGICAL :: bin
+    INTEGER :: i
+    bin = .FALSE.
+    DO i = 1, n
+      IF (ICHAR(buf(i)) == 0) THEN
+        bin = .TRUE.
+        RETURN
+      END IF
+    END DO
+  END FUNCTION is_binary
+
+  ! ===========================================================================
+  ! PRIVATE: is_generated — returns .TRUE. if the file header contains a
+  !   standard auto-generation marker used by cloc to skip generated files.
+  !
+  !   Checked markers (any of these in the first 256 bytes → skip):
+  !     "Code generated"     ← Go: protobuf, gRPC, stringer, mockgen
+  !     "DO NOT EDIT"        ← Go: generic generate marker
+  !     "@generated"         ← JS/TS: Relay, GraphQL codegen, Babel
+  !     "auto-generated"     ← Python, various tools
+  !     "AUTOMATICALLY GENERATED" ← protobuf Python, Thrift
+  !
+  !   Case-insensitive check on the first 256 bytes only.
+  ! ===========================================================================
+  PURE FUNCTION is_generated(buf, n) RESULT(gen)
+    CHARACTER(LEN=1), INTENT(IN) :: buf(:)
+    INTEGER,          INTENT(IN) :: n
+    LOGICAL :: gen
+
+    CHARACTER(LEN=256) :: header
+    INTEGER :: i, c
+
+    gen = .FALSE.
+    IF (n < 1) RETURN
+
+    ! Build lower-case copy of first n bytes
+    DO i = 1, n
+      c = ICHAR(buf(i))
+      IF (c >= 65 .AND. c <= 90) c = c + 32   ! upper → lower
+      header(i:i) = CHAR(c)
+    END DO
+
+    ! Check substrings
+    IF (INDEX(header(1:n), 'code generated')    /= 0) THEN; gen = .TRUE.; RETURN; END IF
+    IF (INDEX(header(1:n), 'do not edit')       /= 0) THEN; gen = .TRUE.; RETURN; END IF
+    IF (INDEX(header(1:n), '@generated')        /= 0) THEN; gen = .TRUE.; RETURN; END IF
+    IF (INDEX(header(1:n), 'auto-generated')    /= 0) THEN; gen = .TRUE.; RETURN; END IF
+    IF (INDEX(header(1:n), 'automatically generated') /= 0) THEN; gen = .TRUE.; RETURN; END IF
+
+  END FUNCTION is_generated
 
   ! ===========================================================================
   ! PRIVATE: flush accumulated line flags into counts.
