@@ -1,5 +1,7 @@
 # FLOC — Fast Lines Of Code Counter
-
+  
+*This software comes with ABSOLUTELY NO WARRANTY, to the extent permitted by applicable law.*
+  
 A **production-quality, cloc-compatible** source-code line counter written in
 Fortran 90/2003 with OpenMP parallelism. Designed to scan repositories with
 millions of files **orders of magnitude faster** than the Perl-based `cloc`
